@@ -19,6 +19,150 @@ logger = logging.getLogger(__name__)
 TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
 
 
+def sensitive_artifact_modes() -> tuple[int | None, int | None]:
+    """Return directory/file modes for sensitive runtime artifacts.
+
+    Managed (NixOS) installs intentionally share state through the ``hermes``
+    group. Containers and explicit ``HERMES_SKIP_CHMOD`` deployments preserve
+    their existing volume policy unless ``HERMES_FORCE_OWNER_ONLY`` is set.
+    Native unmanaged POSIX installs default to owner-only. ``None`` means
+    "create using the process umask and do not tighten an existing object".
+    """
+    if os.name != "posix":
+        return None, None
+    # Explicit opt-out wins even for managed installs: administrators may rely
+    # on ACLs or volume-specific ownership that chmod would destroy.
+    if os.environ.get("HERMES_SKIP_CHMOD"):
+        return None, None
+    try:
+        from hermes_cli.config import _is_container, is_managed
+
+        if is_managed():
+            return 0o2770, 0o660
+        in_container = _is_container()
+    except Exception:
+        in_container = bool(
+            os.environ.get("HERMES_CONTAINER")
+            or os.path.exists("/.dockerenv")
+            or os.path.exists("/run/.containerenv")
+        )
+
+    force_owner_only = str(os.environ.get("HERMES_FORCE_OWNER_ONLY", "")).strip().lower() \
+        in TRUTHY_STRINGS
+    if in_container and not force_owner_only:
+        return None, None
+
+    try:
+        mode_str = os.environ.get("HERMES_HOME_MODE", "").strip()
+        directory_mode = int(mode_str, 8) if mode_str else 0o700
+    except ValueError:
+        directory_mode = 0o700
+    return directory_mode, 0o600
+
+
+def ensure_restricted_directory(
+    path: Union[str, Path], mode: int | None = 0o700
+) -> Path:
+    """Create a real directory and optionally tighten it to ``mode``."""
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True, mode=mode if mode is not None else 0o777)
+    if path.is_symlink():
+        raise OSError(f"refusing symlink directory: {path}")
+    if os.name == "posix":
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            if not stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise NotADirectoryError(path)
+            if mode is not None:
+                os.fchmod(fd, mode)
+        finally:
+            os.close(fd)
+    return path
+
+
+def _open_restricted_text(
+    path: Union[str, Path], *, flags: int, file_mode: int | None, directory_mode: int | None
+) -> int:
+    path = Path(path)
+    ensure_restricted_directory(path.parent, directory_mode)
+    if path.is_symlink():
+        raise OSError(f"refusing symlink file: {path}")
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    create_mode = file_mode if file_mode is not None else 0o666
+    parent_fd = -1
+    try:
+        if os.name == "posix":
+            parent_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            parent_fd = os.open(path.parent, parent_flags)
+            fd = os.open(path.name, flags, create_mode, dir_fd=parent_fd)
+        else:
+            fd = os.open(path, flags, create_mode)
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"refusing non-regular file: {path}")
+        if file_mode is not None and hasattr(os, "fchmod"):
+            os.fchmod(fd, file_mode)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def write_restricted_text(
+    path: Union[str, Path],
+    text: str,
+    *,
+    file_mode: int | None = 0o600,
+    directory_mode: int | None = 0o700,
+) -> None:
+    """Replace text through a no-follow descriptor with an explicit mode."""
+    fd = _open_restricted_text(
+        path,
+        flags=os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        file_mode=file_mode,
+        directory_mode=directory_mode,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = -1
+            fh.write(text)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def append_restricted_text(
+    path: Union[str, Path],
+    text: str,
+    *,
+    file_mode: int | None = 0o600,
+    directory_mode: int | None = 0o700,
+) -> None:
+    """Append text safely, preserving no-follow and mode guarantees per write."""
+    fd = _open_restricted_text(
+        path,
+        flags=os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+        file_mode=file_mode,
+        directory_mode=directory_mode,
+    )
+    try:
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
+            fd = -1
+            fh.write(text)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def is_truthy_value(value: Any, default: bool = False) -> bool:
     """Coerce bool-ish values using the project's shared truthy string set."""
     if value is None:

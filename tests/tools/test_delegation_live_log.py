@@ -28,6 +28,14 @@ from tools.delegation_live_log import (
     wrap_progress_callback,
 )
 
+POSIX_ONLY = pytest.mark.skipif(os.name != "posix", reason="POSIX permission contract")
+
+
+@pytest.fixture(autouse=True)
+def _force_owner_only_artifacts(monkeypatch):
+    monkeypatch.delenv("HERMES_SKIP_CHMOD", raising=False)
+    monkeypatch.setenv("HERMES_FORCE_OWNER_ONLY", "1")
+
 
 # ---------------------------------------------------------------------------
 # Writer unit tests
@@ -47,6 +55,51 @@ def test_writer_precreates_file_with_header():
     assert w.path.name == "task-0.log"
     assert w.path.parent.name == "deleg_test1"
     assert w.path.parent.parent == live_transcript_root()
+
+
+@POSIX_ONLY
+def test_writer_creates_owner_only_directory_and_file(tmp_path):
+    old_umask = os.umask(0o022)
+    try:
+        w = LiveTranscriptWriter("deleg_private", 0, "private goal", root=tmp_path / "live")
+    finally:
+        os.umask(old_umask)
+
+    assert w.path is not None
+    assert w.path.parent.stat().st_mode & 0o777 == 0o700
+    assert w.path.stat().st_mode & 0o777 == 0o600
+
+
+@POSIX_ONLY
+def test_writer_managed_mode_keeps_group_shared_modes(tmp_path, monkeypatch):
+    import hermes_cli.config as config
+
+    monkeypatch.setattr(config, "is_managed", lambda: True)
+    w = LiveTranscriptWriter("deleg_managed", 0, "shared goal", root=tmp_path / "live")
+
+    assert w.path is not None
+    assert w.path.parent.stat().st_mode & 0o7777 == 0o2770
+    assert w.path.stat().st_mode & 0o777 == 0o660
+
+
+@POSIX_ONLY
+def test_writer_container_default_preserves_volume_policy(tmp_path, monkeypatch):
+    import hermes_cli.config as config
+
+    monkeypatch.delenv("HERMES_FORCE_OWNER_ONLY", raising=False)
+    monkeypatch.setattr(config, "is_managed", lambda: False)
+    monkeypatch.setattr(config, "_is_container", lambda: True)
+    old_umask = os.umask(0o022)
+    try:
+        w = LiveTranscriptWriter(
+            "deleg_container", 0, "shared volume", root=tmp_path / "live"
+        )
+    finally:
+        os.umask(old_umask)
+
+    assert w.path is not None
+    assert w.path.parent.stat().st_mode & 0o777 == 0o755
+    assert w.path.stat().st_mode & 0o777 == 0o644
 
 
 def test_writer_event_lines_append_in_order_and_flush_immediately():
@@ -111,6 +164,40 @@ def test_writer_disables_itself_after_write_failure():
     w.assistant_text("should not raise")
     assert w._ok is False
     w.assistant_text("still silent")  # no raise on subsequent calls
+
+
+@POSIX_ONLY
+def test_writer_recreates_unlinked_file_owner_only(tmp_path):
+    w = LiveTranscriptWriter("deleg_recreate", 0, "g", root=tmp_path / "live")
+    path = w.path
+    assert path is not None
+    path.unlink()
+
+    old_umask = os.umask(0o022)
+    try:
+        w.assistant_text("recreated securely")
+    finally:
+        os.umask(old_umask)
+
+    assert path.exists()
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert "recreated securely" in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="platform has no O_NOFOLLOW")
+def test_writer_refuses_symlink_replacement(tmp_path):
+    w = LiveTranscriptWriter("deleg_symlink", 0, "g", root=tmp_path / "live")
+    path = w.path
+    assert path is not None
+    target = tmp_path / "target.log"
+    target.write_text("unchanged", encoding="utf-8")
+    path.unlink()
+    path.symlink_to(target)
+
+    w.assistant_text("must not redirect")
+
+    assert w._ok is False
+    assert target.read_text(encoding="utf-8") == "unchanged"
 
 
 def test_stream_deltas_buffer_and_flush_as_one_line():
@@ -238,6 +325,8 @@ def test_create_live_transcripts_precreates_paths_and_manifest():
     assert manifest["tasks"][1]["log"] == paths[1]
     # Per-task context beats shared context in the kickoff line.
     assert "ctx B" in Path(paths[1]).read_text(encoding="utf-8")
+    assert (live_transcript_root() / deleg_id).stat().st_mode & 0o777 == 0o700
+    assert (live_transcript_root() / deleg_id / "manifest.json").stat().st_mode & 0o777 == 0o600
 
 
 def test_update_manifest_statuses():

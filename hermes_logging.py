@@ -302,7 +302,10 @@ def setup_logging(
     global _logging_initialized
     home = hermes_home or get_hermes_home()
     log_dir = home / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    from utils import ensure_restricted_directory, sensitive_artifact_modes
+
+    directory_mode, _ = sensitive_artifact_modes()
+    ensure_restricted_directory(log_dir, directory_mode)
 
     # Read config defaults (best-effort — config may not be loaded yet).
     cfg_level, cfg_max_size, cfg_backup = _read_logging_config()
@@ -413,7 +416,7 @@ def setup_verbose_logging() -> None:
 # ---------------------------------------------------------------------------
 
 class _ManagedRotatingFileHandler(RotatingFileHandler):
-    """RotatingFileHandler that ensures group-writable perms in managed mode
+    """RotatingFileHandler that enforces deployment-appropriate permissions
     AND survives external rotation.
 
     Two responsibilities:
@@ -422,8 +425,10 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         inherit the hermes group. However, both ``_open()`` (initial creation)
         and ``doRollover()`` create files via ``open()``, which uses the
         process umask — typically 0022, producing 0644. This subclass applies
-        ``chmod 0660`` after both operations so the gateway and interactive
-        users can share log files.
+        the deployment policy after both operations: ``0660`` for managed
+        installs, ``0600`` for native unmanaged or explicitly owner-only
+        containers, and no chmod for compatibility-preserving container/NAS
+        deployments.
 
     2.  ``RotatingFileHandler`` keeps an open file descriptor.  If anything
         rotates the file *externally* (``logrotate``, manual ``mv``,
@@ -438,8 +443,9 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
     """
 
     def __init__(self, *args, **kwargs):
-        from hermes_cli.config import is_managed
-        self._managed = is_managed()
+        from utils import sensitive_artifact_modes
+
+        self._directory_mode, self._file_mode = sensitive_artifact_modes()
         super().__init__(*args, **kwargs)
         # Snapshot the inode of the currently open stream so emit() can
         # detect external rotation without an extra fstat per write.
@@ -447,17 +453,24 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         self._stat_ino: Optional[int] = None
         self._record_stream_stat()
 
-    def _chmod_if_managed(self):
-        if self._managed:
-            try:
-                os.chmod(self.baseFilename, 0o660)
-            except OSError:
-                pass
+    def _chmod_for_deployment(self):
+        if self._file_mode is None:
+            return
+        try:
+            if self.stream is not None and hasattr(os, "fchmod"):
+                os.fchmod(self.stream.fileno(), self._file_mode)
+            else:
+                os.chmod(self.baseFilename, self._file_mode)
+        except OSError:
+            pass
 
     def _record_stream_stat(self) -> None:
-        """Snapshot dev/ino of ``baseFilename`` so we can detect external rotation."""
+        """Snapshot dev/ino of the active stream so external rotation is detectable."""
         try:
-            st = os.stat(self.baseFilename)
+            if self.stream is not None:
+                st = os.fstat(self.stream.fileno())
+            else:
+                st = os.stat(self.baseFilename)
             self._stat_dev, self._stat_ino = st.st_dev, st.st_ino
         except OSError:
             self._stat_dev, self._stat_ino = None, None
@@ -535,13 +548,48 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         super().handleError(record)
 
     def _open(self):
-        stream = super()._open()
-        self._chmod_if_managed()
-        return stream
+        if self._file_mode is None or os.name != "posix":
+            return super()._open()
+
+        from utils import ensure_restricted_directory
+
+        path = Path(self.baseFilename)
+        ensure_restricted_directory(path.parent, self._directory_mode)
+        flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        if "a" in self.mode:
+            flags |= os.O_APPEND
+        elif "w" in self.mode:
+            flags |= os.O_TRUNC
+        elif "x" in self.mode:
+            flags |= os.O_EXCL
+        else:
+            return super()._open()
+
+        parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        parent_flags |= getattr(os, "O_NOFOLLOW", 0)
+        parent_fd = os.open(path.parent, parent_flags)
+        fd = -1
+        try:
+            fd = os.open(path.name, flags, self._file_mode, dir_fd=parent_fd)
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, self._file_mode)
+            stream = io.open(
+                fd,
+                self.mode,
+                encoding=self.encoding,
+                errors=self.errors,
+                closefd=True,
+            )
+            fd = -1
+            return stream
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            os.close(parent_fd)
 
     def doRollover(self):
         super().doRollover()
-        self._chmod_if_managed()
+        self._chmod_for_deployment()
         # Our own rollover writes a new baseFilename; refresh the snapshot
         # so the next emit doesn't mistake it for external rotation.
         self._record_stream_stat()
@@ -745,7 +793,10 @@ def _add_rotating_handler(
         ):
             return  # already attached
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+    from utils import ensure_restricted_directory, sensitive_artifact_modes
+
+    directory_mode, _ = sensitive_artifact_modes()
+    ensure_restricted_directory(path.parent, directory_mode)
     handler = _ManagedRotatingFileHandler(
         str(path), maxBytes=max_bytes, backupCount=backup_count,
         encoding="utf-8",

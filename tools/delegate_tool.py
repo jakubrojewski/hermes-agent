@@ -39,7 +39,13 @@ from toolsets import TOOLSETS
 _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
-from utils import base_url_hostname, is_truthy_value
+from utils import (
+    base_url_hostname,
+    ensure_restricted_directory,
+    is_truthy_value,
+    sensitive_artifact_modes,
+    write_restricted_text,
+)
 
 
 # Tools that children must never have access to
@@ -1501,7 +1507,8 @@ def _dump_subagent_timeout_diagnostic(
         hermes_home = get_hermes_home()
         logs_dir = hermes_home / "logs"
         try:
-            logs_dir.mkdir(parents=True, exist_ok=True)
+            dir_mode, file_mode = sensitive_artifact_modes()
+            ensure_restricted_directory(logs_dir, dir_mode)
         except Exception:
             return None
 
@@ -1609,7 +1616,12 @@ def _dump_subagent_timeout_diagnostic(
         _w("  Common causes: oversized prompt rejected by provider, transport hang,")
         _w("  credential resolution stuck. See issue #14726 for context.")
 
-        dump_path.write_text("\n".join(lines), encoding="utf-8")
+        write_restricted_text(
+            dump_path,
+            "\n".join(lines),
+            file_mode=file_mode,
+            directory_mode=dir_mode,
+        )
         return str(dump_path)
     except Exception as exc:
         logger.warning("Subagent timeout diagnostic dump failed: %s", exc)
@@ -1631,10 +1643,16 @@ def _spill_summary_to_file(task_index: int, summary: str) -> Optional[str]:
         import datetime as _dt
 
         cache_dir = get_hermes_dir("cache/delegation", "delegation_cache")
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        dir_mode, file_mode = sensitive_artifact_modes()
+        ensure_restricted_directory(cache_dir, dir_mode)
         ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         path = cache_dir / f"subagent-summary-{task_index}-{ts}.txt"
-        path.write_text(summary, encoding="utf-8")
+        write_restricted_text(
+            path,
+            summary,
+            file_mode=file_mode,
+            directory_mode=dir_mode,
+        )
         return str(path)
     except Exception as exc:
         logger.debug("Failed to spill subagent summary to file: %s", exc)

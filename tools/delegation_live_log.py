@@ -38,6 +38,13 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from utils import (
+    append_restricted_text,
+    ensure_restricted_directory,
+    sensitive_artifact_modes,
+    write_restricted_text,
+)
+
 logger = logging.getLogger(__name__)
 
 # Live transcript directories older than this are pruned on new dispatches.
@@ -125,9 +132,11 @@ class LiveTranscriptWriter:
         self._stream_buf: List[str] = []
         self._stream_len = 0
         try:
+            self._dir_mode, self._file_mode = sensitive_artifact_modes()
             base = (root if root is not None else live_transcript_root())
+            ensure_restricted_directory(base, self._dir_mode)
             d = base / delegation_id
-            d.mkdir(parents=True, exist_ok=True)
+            ensure_restricted_directory(d, self._dir_mode)
             self.path: Optional[Path] = d / f"task-{task_index}.log"
             header = [
                 "=== Hermes subagent live transcript ===",
@@ -139,7 +148,12 @@ class LiveTranscriptWriter:
                 "(append-only; streams while the subagent runs — tail -f me)",
                 "=" * 40,
             ]
-            self.path.write_text("\n".join(header) + "\n", encoding="utf-8")
+            write_restricted_text(
+                self.path,
+                "\n".join(header) + "\n",
+                file_mode=self._file_mode,
+                directory_mode=self._dir_mode,
+            )
             self.event("user", "kickoff: " + _one_line(goal, _KICKOFF_MAX)
                        + (f" | context: {_one_line(context, _KICKOFF_MAX)}" if context else ""))
         except Exception as exc:
@@ -159,10 +173,16 @@ class LiveTranscriptWriter:
         line = f"{time.strftime('%H:%M:%S')} {role:<9}| {_redact(text)}\n"
         try:
             with self._lock:
-                # Append mode per write: no held handle, survives child crash,
-                # and the close() acts as the flush.
-                with open(self.path, "a", encoding="utf-8") as fh:
-                    fh.write(line)
+                # No held handle, so child crashes remain harmless. Re-open
+                # through the no-follow helper on every event: unlink/recreate
+                # keeps the deployment mode and a symlink replacement fails
+                # closed instead of redirecting sensitive transcript data.
+                append_restricted_text(
+                    self.path,
+                    line,
+                    file_mode=self._file_mode,
+                    directory_mode=self._dir_mode,
+                )
         except Exception as exc:
             self._ok = False
             logger.debug("Live transcript write failed (%s): %s", self.path, exc)
@@ -353,6 +373,7 @@ def _manifest_path(delegation_id: str) -> Path:
 def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                     paths: List[str]) -> None:
     try:
+        dir_mode, file_mode = sensitive_artifact_modes()
         manifest = {
             "delegation_id": delegation_id,
             "started": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -372,8 +393,11 @@ def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                 for i, t in enumerate(task_list)
             ],
         }
-        _manifest_path(delegation_id).write_text(
-            json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+        write_restricted_text(
+            _manifest_path(delegation_id),
+            json.dumps(manifest, indent=2, ensure_ascii=False),
+            file_mode=file_mode,
+            directory_mode=dir_mode,
         )
     except Exception as exc:
         logger.debug("Live transcript manifest write failed: %s", exc)
@@ -385,6 +409,7 @@ def update_manifest_statuses(delegation_id: Optional[str],
     if not delegation_id:
         return
     try:
+        dir_mode, file_mode = sensitive_artifact_modes()
         mp = _manifest_path(delegation_id)
         manifest = json.loads(mp.read_text(encoding="utf-8"))
         by_index = {r.get("task_index"): r for r in results if isinstance(r, dict)}
@@ -395,8 +420,12 @@ def update_manifest_statuses(delegation_id: Optional[str],
                 if r.get("exit_reason"):
                     task["exit_reason"] = r["exit_reason"]
         manifest["completed"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        mp.write_text(json.dumps(manifest, indent=2, ensure_ascii=False),
-                      encoding="utf-8")
+        write_restricted_text(
+            mp,
+            json.dumps(manifest, indent=2, ensure_ascii=False),
+            file_mode=file_mode,
+            directory_mode=dir_mode,
+        )
     except Exception as exc:
         logger.debug("Live transcript manifest update failed: %s", exc)
 

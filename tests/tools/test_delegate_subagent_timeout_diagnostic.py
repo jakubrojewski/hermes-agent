@@ -16,6 +16,7 @@ These tests pin:
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from pathlib import Path
@@ -29,6 +30,8 @@ def hermes_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_FORCE_OWNER_ONLY", "1")
+    monkeypatch.delenv("HERMES_SKIP_CHMOD", raising=False)
     return home
 
 
@@ -113,6 +116,9 @@ class TestDumpSubagentTimeoutDiagnostic:
         assert p.is_file()
         # File lives under HERMES_HOME/logs/
         assert p.parent == hermes_home / "logs"
+        if os.name == "posix":
+            assert p.parent.stat().st_mode & 0o777 == 0o700
+            assert p.stat().st_mode & 0o777 == 0o600
         assert p.name.startswith("subagent-timeout-sa-7-abc123-")
         assert p.suffix == ".log"
 

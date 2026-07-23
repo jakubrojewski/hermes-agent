@@ -8,11 +8,18 @@ full summaries verbatim into the parent.
 """
 
 import os
+from pathlib import Path
 import tempfile
 
 import pytest
 
 import tools.delegate_tool as dt
+
+
+@pytest.fixture(autouse=True)
+def _force_owner_only_artifacts(monkeypatch):
+    monkeypatch.delenv("HERMES_SKIP_CHMOD", raising=False)
+    monkeypatch.setenv("HERMES_FORCE_OWNER_ONLY", "1")
 
 
 class _FakeCompressor:
@@ -67,6 +74,44 @@ def test_batch_overflow_trimmed_and_spilled_losslessly(monkeypatch):
             assert "offset=" in r["summary"]
             # Spilled into the delegation cache (mounted into remote backends).
             assert os.path.join("cache", "delegation") in path
+            if os.name == "posix":
+                assert Path(path).parent.stat().st_mode & 0o777 == 0o700
+                assert Path(path).stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission contract")
+def test_summary_spill_managed_mode_is_group_shared(tmp_path, monkeypatch):
+    import hermes_cli.config as config
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr(config, "is_managed", lambda: True)
+
+    spill_path = dt._spill_summary_to_file(0, "managed summary")
+    assert spill_path is not None
+    path = Path(spill_path)
+
+    assert path.parent.stat().st_mode & 0o7777 == 0o2770
+    assert path.stat().st_mode & 0o777 == 0o660
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission contract")
+def test_summary_spill_container_default_preserves_volume_policy(tmp_path, monkeypatch):
+    import hermes_cli.config as config
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_FORCE_OWNER_ONLY", raising=False)
+    monkeypatch.setattr(config, "is_managed", lambda: False)
+    monkeypatch.setattr(config, "_is_container", lambda: True)
+    old_umask = os.umask(0o022)
+    try:
+        spill_path = dt._spill_summary_to_file(0, "container summary")
+        assert spill_path is not None
+        path = Path(spill_path)
+    finally:
+        os.umask(old_umask)
+
+    assert path.parent.stat().st_mode & 0o777 == 0o755
+    assert path.stat().st_mode & 0o777 == 0o644
 
 
 def test_dynamic_budget_shrinks_as_batch_grows():

@@ -17,11 +17,13 @@ import hermes_logging
 # aliases concurrent-log-handler's ConcurrentRotatingFileHandler on Windows
 # (the #44873 fix) but keeps stdlib RotatingFileHandler on POSIX, so importing
 # the name from the module under test keeps the two in lockstep.
-from hermes_logging import RotatingFileHandler
+from hermes_logging import RotatingFileHandler, _ManagedRotatingFileHandler
+
+POSIX_ONLY = pytest.mark.skipif(os.name != "posix", reason="POSIX permission contract")
 
 
 @pytest.fixture(autouse=True)
-def _reset_logging_state():
+def _reset_logging_state(monkeypatch):
     """Reset the module-level sentinel and clean up root logger handlers
     added by setup_logging() so tests don't leak state.
 
@@ -30,6 +32,8 @@ def _reset_logging_state():
     logger.  We strip ALL RotatingFileHandlers before each test so the count
     assertions are stable regardless of test ordering.
     """
+    monkeypatch.delenv("HERMES_SKIP_CHMOD", raising=False)
+    monkeypatch.setenv("HERMES_FORCE_OWNER_ONLY", "1")
     hermes_logging._logging_initialized = False
     # File handlers now live behind the async QueueListener, not on the root
     # logger; tear down any leaked from other xdist tests in this worker.
@@ -68,10 +72,33 @@ def hermes_home(tmp_path, monkeypatch):
 class TestSetupLogging:
     """setup_logging() creates agent.log + errors.log with RotatingFileHandler."""
 
+    @POSIX_ONLY
     def test_creates_log_directory(self, hermes_home):
         log_dir = hermes_logging.setup_logging(hermes_home=hermes_home)
         assert log_dir == hermes_home / "logs"
         assert log_dir.is_dir()
+        assert stat.S_IMODE(log_dir.stat().st_mode) == 0o700
+
+    @POSIX_ONLY
+    def test_setup_refuses_symlink_log_directory_without_chmod_target(self, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        target = tmp_path / "shared-logs"
+        target.mkdir()
+        os.chmod(target, 0o755)
+        (home / "logs").symlink_to(target, target_is_directory=True)
+
+        with pytest.raises(OSError, match="symlink directory"):
+            hermes_logging.setup_logging(hermes_home=home)
+
+        assert stat.S_IMODE(target.stat().st_mode) == 0o755
+
+    @POSIX_ONLY
+    def test_managed_log_directory_is_group_shared(self, hermes_home):
+        with patch("hermes_cli.config.is_managed", return_value=True):
+            log_dir = hermes_logging.setup_logging(hermes_home=hermes_home)
+
+        assert stat.S_IMODE(log_dir.stat().st_mode) == 0o2770
 
     def test_creates_agent_log_handler(self, hermes_home):
         hermes_logging.setup_logging(hermes_home=hermes_home)
@@ -668,6 +695,124 @@ class TestAddRotatingHandler:
                 logger.removeHandler(h)
                 h.close()
 
+    @POSIX_ONLY
+    def test_unmanaged_mode_initial_open_is_owner_only(self, tmp_path):
+        log_path = tmp_path / "private" / "owner-only.log"
+        logger = logging.getLogger("_test_rotating_owner_only")
+        formatter = logging.Formatter("%(message)s")
+
+        old_umask = os.umask(0o022)
+        try:
+            with patch("hermes_cli.config.is_managed", return_value=False):
+                hermes_logging._add_rotating_handler(
+                    logger, log_path,
+                    level=logging.INFO, max_bytes=1024, backup_count=1,
+                    formatter=formatter,
+                )
+        finally:
+            os.umask(old_umask)
+
+        assert stat.S_IMODE(log_path.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+
+        for h in list(logger.handlers):
+            if isinstance(h, RotatingFileHandler):
+                logger.removeHandler(h)
+                h.close()
+
+    @POSIX_ONLY
+    def test_add_handler_refuses_symlink_parent_without_chmod_target(self, tmp_path):
+        target = tmp_path / "shared"
+        target.mkdir()
+        os.chmod(target, 0o755)
+        linked = tmp_path / "linked"
+        linked.symlink_to(target, target_is_directory=True)
+        logger = logging.getLogger("_test_symlink_parent")
+
+        with pytest.raises(OSError, match="symlink directory"):
+            hermes_logging._add_rotating_handler(
+                logger,
+                linked / "test.log",
+                level=logging.INFO,
+                max_bytes=1024,
+                backup_count=1,
+                formatter=logging.Formatter("%(message)s"),
+            )
+
+        assert stat.S_IMODE(target.stat().st_mode) == 0o755
+
+    @POSIX_ONLY
+    def test_owner_only_open_refuses_symlink(self, tmp_path):
+        target = tmp_path / "target.log"
+        target.write_text("marker", encoding="utf-8")
+        os.chmod(target, 0o644)
+        link = tmp_path / "agent.log"
+        link.symlink_to(target)
+
+        with pytest.raises(OSError):
+            _ManagedRotatingFileHandler(link, maxBytes=1024, backupCount=1)
+
+        assert target.read_text(encoding="utf-8") == "marker"
+        assert stat.S_IMODE(target.stat().st_mode) == 0o644
+
+    @POSIX_ONLY
+    def test_container_default_preserves_volume_modes(self, tmp_path, monkeypatch):
+        log_path = tmp_path / "container" / "shared.log"
+        logger = logging.getLogger("_test_rotating_container_shared")
+        formatter = logging.Formatter("%(message)s")
+        monkeypatch.delenv("HERMES_FORCE_OWNER_ONLY", raising=False)
+
+        old_umask = os.umask(0o022)
+        try:
+            with (
+                patch("hermes_cli.config.is_managed", return_value=False),
+                patch("hermes_cli.config._is_container", return_value=True),
+            ):
+                hermes_logging._add_rotating_handler(
+                    logger,
+                    log_path,
+                    level=logging.INFO,
+                    max_bytes=1024,
+                    backup_count=1,
+                    formatter=formatter,
+                )
+        finally:
+            os.umask(old_umask)
+
+        assert stat.S_IMODE(log_path.parent.stat().st_mode) == 0o755
+        assert stat.S_IMODE(log_path.stat().st_mode) == 0o644
+
+        for h in list(logger.handlers):
+            if isinstance(h, RotatingFileHandler):
+                logger.removeHandler(h)
+                h.close()
+
+    @POSIX_ONLY
+    def test_unmanaged_mode_rollover_keeps_owner_only(self, tmp_path):
+        log_path = tmp_path / "private-rollover.log"
+        logger = logging.getLogger("_test_rotating_owner_only_rollover")
+        formatter = logging.Formatter("%(message)s")
+
+        old_umask = os.umask(0o022)
+        try:
+            with patch("hermes_cli.config.is_managed", return_value=False):
+                hermes_logging._add_rotating_handler(
+                    logger, log_path,
+                    level=logging.INFO, max_bytes=1, backup_count=1,
+                    formatter=formatter,
+                )
+                logger.info("a" * 256)
+                hermes_logging.flush_log_queue()
+        finally:
+            os.umask(old_umask)
+
+        assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+
+        for h in list(logger.handlers):
+            if isinstance(h, RotatingFileHandler):
+                logger.removeHandler(h)
+                h.close()
+
     def test_no_duplicate_for_same_path(self, tmp_path):
         log_path = tmp_path / "test.log"
         logger = logging.getLogger("_test_rotating_dup")
@@ -748,6 +893,7 @@ class TestAddRotatingHandler:
                 logger.removeHandler(h)
                 h.close()
 
+    @POSIX_ONLY
     def test_managed_mode_initial_open_sets_group_writable(self, tmp_path):
         log_path = tmp_path / "managed-open.log"
         logger = logging.getLogger("_test_rotating_managed_open")
@@ -772,6 +918,7 @@ class TestAddRotatingHandler:
                 logger.removeHandler(h)
                 h.close()
 
+    @POSIX_ONLY
     def test_managed_mode_rollover_sets_group_writable(self, tmp_path):
         log_path = tmp_path / "managed-rollover.log"
         logger = logging.getLogger("_test_rotating_managed_rollover")
