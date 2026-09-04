@@ -112,7 +112,7 @@ jobs:
               "/etc/hermes/image-provenance.json",
           ], text=True))
           assert provenance["revision"] == os.environ["GITHUB_SHA"]
-          assert provenance["candidate_identity"] == "bfbaf9b7755957ad27c118de178aa418d6fdea056e63931e298a4ade841e8681"
+          assert provenance["candidate_identity"] == "da2e2829be99791160b3c3c76a4886970ba75a38ec494ee3e7dcac0ef1cbfdc4"
           assert provenance["base_digest"] == "sha256:64923faeae267792bf9bf87fe3b4c4869e35004e360c7df01730ad801b74d524"
           PY
 

@@ -167,7 +167,7 @@ class TestWorkerTeardownOnCeiling:
         """Deadline observation alone must not impersonate a host cancellation."""
         _db, agent = _build_agent(tmp_path, "PASSIVE_DEADLINE")
         original = _messages()
-        fence = CompressionCommitFence(total_ceiling_seconds=0.05)
+        fence = CompressionCommitFence()
         provider_started = threading.Event()
         release_provider = threading.Event()
         provider_done = threading.Event()
@@ -199,11 +199,13 @@ class TestWorkerTeardownOnCeiling:
         owner = threading.Thread(target=_owner, daemon=True)
         owner.start()
         try:
-            assert provider_started.wait(1)
+            assert provider_started.wait(5)
+            fence.set_total_ceiling_seconds(0.05)
             assert not owner_done.wait(0.15), (
                 "passive deadline cancelled the auxiliary owner before the host "
                 "won fence cancellation"
             )
+            assert fence.deadline_exceeded
             assert fence.cancel_before_commit() is True
             assert owner_done.wait(0.5)
             assert not provider_done.is_set()
