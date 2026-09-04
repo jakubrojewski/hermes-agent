@@ -2236,6 +2236,29 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
     return f"[{tool_name}]{first_arg} ({content_len:,} chars result)"
 
 
+def _summarize_tool_handoff(
+    tool_name: str,
+    tool_args: str,
+    tool_content: str,
+) -> str:
+    """Keep recovery anchors without forwarding opaque tool output."""
+    name = tool_name or "unknown"
+    text = _redact_compaction_text(tool_content or "")
+    anchors: list[str] = []
+    for path in _PATH_MENTION_RE.findall(f"{tool_args}\n{text}"):
+        _dedupe_append(anchors, path.rstrip(".,:;"), limit=3)
+    errors = re.findall(
+        r"[^\n]{0,80}(?:\b\w*error\b|\b(?:failed|exception|traceback|timeout|timed out|fatal)\b)[^\n]{0,180}",
+        text,
+        re.I,
+    )
+    if errors:
+        anchors.append(errors[-1].strip())
+    if anchors:
+        return f"[{name}] " + "; ".join(anchors)
+    return f"[{name}] completed ({len(tool_content or '')} chars output omitted)"
+
+
 def resolve_model_threshold(
     model: str,
     model_thresholds: dict[str, float] | None,
@@ -4552,13 +4575,19 @@ class ContextCompressor(ContextEngine):
             text = re.sub(r"\bgh[pousr]_[A-Za-z0-9_]{8,}\b", "[REDACTED]", text)
             text = re.sub(r"\s+", " ", text).strip()
             if len(text) > _FALLBACK_TURN_MAX_CHARS:
-                text = text[: _FALLBACK_TURN_MAX_CHARS - 15].rstrip() + " ...[truncated]"
+                marker = " ...[truncated]... "
+                tail_chars = 220
+                head_chars = _FALLBACK_TURN_MAX_CHARS - len(marker) - tail_chars
+                text = text[:head_chars].rstrip() + marker + text[-tail_chars:].lstrip()
             return re.sub(r"\bgh[pousr]_[A-Za-z0-9_.-]+", "[REDACTED]", text)
 
         def _remember_dropped_turn(label: str, text: str, *, limit: int = 8) -> None:
             text = text.strip()
             if not text:
                 return
+            if len(text) > 360:
+                marker = " ...[truncated]... "
+                text = text[:140].rstrip() + marker + text[-190:].lstrip()
             last_dropped_turns.append(f"{label}: {text}")
             if len(last_dropped_turns) > limit:
                 del last_dropped_turns[0]
@@ -4608,6 +4637,14 @@ class ContextCompressor(ContextEngine):
                 if turn_tool_names:
                     prefix = "tool calls: " + ", ".join(turn_tool_names[:6])
                     turn_text = f"{prefix}; {turn_text}" if turn_text else prefix
+            elif role == "tool":
+                call_id = str(msg.get("tool_call_id") or "")
+                tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
+                turn_text = _summarize_tool_handoff(
+                    tool_name,
+                    tool_args,
+                    text or "",
+                )
             turn_label = "INTERNAL CONTEXT" if synthetic_user else str(role).upper()
             _remember_dropped_turn(turn_label, turn_text)
 
@@ -4628,17 +4665,13 @@ class ContextCompressor(ContextEngine):
                 elif text:
                     assistant_actions.append(text)
             elif role == "tool":
-                call_id = str(msg.get("tool_call_id") or "")
-                tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
-                tool_actions.append(
-                    _summarize_tool_result(tool_name, tool_args, text or "")
-                )
+                tool_actions.append(turn_text)
                 if re.search(
-                    r"\b(error|failed|exception|traceback|timeout|timed out|fatal)\b",
+                    r"(?:\b(?:failed|exception|traceback|timeout|timed out|fatal)\b|\b\w*error\b)",
                     text,
                     re.I,
                 ):
-                    blockers.append(text[:500])
+                    blockers.append(turn_text[:500])
 
         def _bullets(items: list[str], limit: int = 8) -> str:
             unique: list[str] = []
@@ -4655,6 +4688,9 @@ class ContextCompressor(ContextEngine):
 
         completed: list[str] = []
         for idx, item in enumerate((assistant_actions + tool_actions)[:12], start=1):
+            # ponytail: cap excerpts so blockers/paths survive; add per-section budgets if richer handoffs matter.
+            if len(item) > 240:
+                item = item[:237].rstrip() + "..."
             completed.append(f"{idx}. {item}")
 
         active_task = (
@@ -4695,9 +4731,6 @@ Recovered from a deterministic fallback because the LLM context summarizer was u
 ## Active State
 Unknown from deterministic fallback. Inspect current repository/session state if needed.
 
-## Blocked
-{_bullets(blockers, limit=5)}
-
 ## Key Decisions
 None recoverable from deterministic fallback.
 
@@ -4710,6 +4743,9 @@ None recoverable from deterministic fallback.
 ## Last Dropped Turns
 {_bullets(last_dropped_turns, limit=8)}
 
+## Blocked
+{_bullets(blockers, limit=5)}
+
 ## Critical Context
 Summary generation was unavailable, so this is a best-effort deterministic fallback for {len(turns_to_summarize)} compacted message(s).{reason_text}"""
         # Ghost-skill defense (#32106): the fallback's per-turn truncation
@@ -4720,12 +4756,16 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         _pruned_names = _collect_ghosted_skill_names(turns_to_summarize)
         del _pruned_names[_MAX_PRUNED_SKILL_MARKERS:]
         summary = self._with_summary_prefix(_redact_compaction_text(body.strip()))
-        if len(summary) > _FALLBACK_SUMMARY_MAX_CHARS:
-            summary = summary[: _FALLBACK_SUMMARY_MAX_CHARS - 42].rstrip() + "\n...[fallback summary truncated]"
-        # Re-inject AFTER the size cap: the markers live at the end of the
-        # body, exactly where the truncation above cuts.
-        summary = _reinject_pruned_skill_markers(summary, _pruned_names)
         summary = self._augment_summary_lean(summary, turns_to_summarize)
+        # Put ghost-skill markers at the final tail before applying the hard
+        # bound so head+tail truncation preserves both the active task and the
+        # reload instructions.
+        summary = _reinject_pruned_skill_markers(summary, _pruned_names)
+        if len(summary) > _FALLBACK_SUMMARY_MAX_CHARS:
+            marker = "\n...[fallback summary middle truncated]...\n"
+            tail_chars = 5_000
+            head_chars = _FALLBACK_SUMMARY_MAX_CHARS - len(marker) - tail_chars
+            summary = summary[:head_chars].rstrip() + marker + summary[-tail_chars:].lstrip()
         return summary
 
     def _demote_stale_tail_tools(
@@ -8840,3 +8880,21 @@ def is_user_originated_turn(message: Any) -> bool:
     count.
     """
     return user_originated_turn_view(message) is not None
+
+
+def build_static_handoff(
+    turns_to_summarize: List[Dict[str, Any]],
+    reason: str | None = None,
+) -> str:
+    """Build a bounded handoff without providers or privileged prompt roles."""
+    # The builder is pure once these three state fields are fixed. Avoiding
+    # __init__ prevents model metadata/provider setup on an emergency path.
+    compressor = object.__new__(ContextCompressor)
+    compressor._previous_summary = None
+    compressor.tail_mode = "legacy"
+    safe_turns = [
+        turn
+        for turn in turns_to_summarize
+        if turn.get("role") in {"user", "assistant", "tool"}
+    ]
+    return compressor._build_static_fallback_summary(safe_turns, reason)

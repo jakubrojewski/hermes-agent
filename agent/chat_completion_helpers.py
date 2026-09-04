@@ -3040,86 +3040,31 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     # Shared constant so compaction recognizers can identify this runtime nudge
     # by its stable content after SessionDB projection strips metadata flags
     # (see MAX_ITERATIONS_SUMMARY_REQUEST / _is_synthetic_compression_user_turn).
-    from agent.context_compressor import MAX_ITERATIONS_SUMMARY_REQUEST
+    from agent.context_compressor import (
+        MAX_ITERATIONS_SUMMARY_REQUEST,
+        build_static_handoff,
+    )
 
     summary_request = MAX_ITERATIONS_SUMMARY_REQUEST
-    append_message(messages, {"role": "user", "content": summary_request})
+    local_handoff = build_static_handoff(
+        messages,
+        reason=f"iteration budget exhausted ({api_call_count}/{agent.max_iterations})",
+    )
 
     try:
-        # Build API messages, stripping internal-only fields
-        # (finish_reason, reasoning) that strict APIs like Mistral reject with 422
-        _needs_sanitize = agent._should_sanitize_tool_calls()
-        api_messages = []
-        for msg in messages:
-            api_msg = msg.copy()
-            agent._copy_reasoning_content_for_api(msg, api_msg)
-            for internal_field in ("reasoning", "finish_reason"):
-                api_msg.pop(internal_field, None)
-            # Strict OpenAI-compatible gateways (Fireworks-backed OpenCode Go,
-            # Mistral, Moonshot/Kimi) reject any message key outside the Chat
-            # Completions schema. The main loop drops these via
-            # ChatCompletionsTransport.convert_messages(), but the summary path
-            # hand-builds messages and calls chat.completions.create() directly,
-            # bypassing the transport — so mirror that sanitization here:
-            # tool_name (SQLite FTS bookkeeping), the codex_* reasoning carriers,
-            # timestamp (preserved on gateway user replay entries for the
-            # stale-confirmation expiry check — #47868 rejection class),
-            # and every Hermes-internal underscore-prefixed scaffolding key.
-            for schema_foreign in ("tool_name", "codex_reasoning_items", "codex_message_items", "timestamp"):
-                api_msg.pop(schema_foreign, None)
-            # api_content (the persist-what-you-send sidecar) carries the
-            # exact bytes every main-loop call sent for this message —
-            # substitute it before dropping the key (Hermes bookkeeping,
-            # never a provider field), mirroring the loop's api_messages
-            # build. Popping without substituting would send CLEAN content
-            # here, diverging the summary request's prefix at the EARLIEST
-            # sidecar-carrying message and re-prefilling the whole transcript
-            # at exactly the moment the context is largest.
-            substitute_api_content(api_msg)
-            if _needs_sanitize:
-                # In MoA mode, agent.model is the virtual preset name,
-                # not the actual aggregator model.  Resolve the real
-                # aggregator model so Gemini preserves thought_signature.
-                _sanitize_model = agent.model
-                if agent.provider == "moa":
-                    _moa_client = getattr(agent, "client", None)
-                    if _moa_client is not None:
-                        _agg_slot = getattr(_moa_client, "last_aggregator_slot", None)
-                        if _agg_slot and _agg_slot.get("model"):
-                            _sanitize_model = _agg_slot["model"]
-                agent._sanitize_tool_calls_for_strict_api(api_msg, model=_sanitize_model)
-            api_messages.append(api_msg)
-
-        effective_system = agent._cached_system_prompt or ""
-        if agent.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
-        if effective_system:
-            api_messages = [{"role": "system", "content": effective_system}] + api_messages
-        if agent.prefill_messages:
-            sys_offset = 1 if effective_system else 0
-            for idx, pfm in enumerate(agent.prefill_messages):
-                api_messages.insert(sys_offset + idx, pfm.copy())
-
-        # Same safety net as the main loop: repair tool-call/result
-        # pairing before asking for a final summary.  Compression and
-        # session resume can leave a tool result whose parent assistant
-        # tool_call was summarized away; Responses API rejects that as
-        # "No tool call found for function call output".
-        api_messages = agent._sanitize_api_messages(api_messages)
-
-        # Same safety net as the main loop: drop thinking-only assistant
-        # turns so Anthropic-family providers don't 400 the summary call.
-        # _thinking_prefill must survive until here so the drop pass can
-        # recognize stubs after reasoning fields are stripped.
-        api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
-
-        # Strip all remaining underscore-prefixed scaffolding keys before the
-        # wire. The summary path calls chat.completions.create() directly,
-        # bypassing the transport's universal underscore-key sweeper.
-        for api_msg in api_messages:
-            if isinstance(api_msg, dict):
-                for internal_key in [k for k in api_msg if isinstance(k, str) and k.startswith("_")]:
-                    api_msg.pop(internal_key, None)
+        # Never resend an already oversized history to ask the provider to
+        # summarize it. The deterministic handoff is local, redacted, bounded,
+        # and contains no tool protocol that strict providers need to repair.
+        api_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Return a concise user-facing final status from the supplied handoff. "
+                    "Do not call tools and do not invent work that is not recorded."
+                ),
+            },
+            {"role": "user", "content": f"{summary_request}\n\n{local_handoff}"},
+        ]
 
         summary_extra_body = {}
         try:
@@ -3160,9 +3105,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             summary_extra_body["tags"] = _portal_tags()
 
         if agent.api_mode == "codex_responses":
-            codex_kwargs = agent._build_api_kwargs(api_messages)
-            codex_kwargs.pop("tools", None)
-            summary_response = agent._run_codex_stream(codex_kwargs)
+            codex_kwargs = agent._build_api_kwargs(api_messages, tools_for_api=[])
+            for key in ("tools", "tool_choice", "parallel_tool_calls"):
+                codex_kwargs.pop(key, None)
+            summary_response = agent._run_codex_stream(codex_kwargs, max_retries=0)
             _ct_sum = agent._get_transport()
             _cnr_sum = _ct_sum.normalize_response(summary_response)
             final_response = (_cnr_sum.content or "").strip()
@@ -3244,7 +3190,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 _ant_kw = _merge_nous_portal_messages_extra_body(agent, _ant_kw)
                 summary_response = _managed_summary_call(
                     _ant_kw,
-                    agent._anthropic_messages_create,
+                    lambda request: agent._anthropic_messages_create(
+                        request,
+                        prefer_stream=False,
+                    ),
                     retry_count=0,
                 )
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
@@ -3261,88 +3210,15 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 _summary_result = agent._get_transport().normalize_response(summary_response)
                 final_response = (_summary_result.content or "").strip()
 
+        final_response = agent._strip_think_blocks(final_response).strip()
         if final_response:
-            if "<think>" in final_response:
-                final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
-            if final_response:
-                summary_call_outcome = "success"
-                append_message(
-                    messages,
-                    {"role": "assistant", "content": final_response},
-                )
-            else:
-                final_response = "I reached the iteration limit and couldn't generate a summary."
+            summary_call_outcome = "success"
         else:
-            # Retry summary generation
-            if agent.api_mode == "codex_responses":
-                codex_kwargs = agent._build_api_kwargs(api_messages)
-                codex_kwargs.pop("tools", None)
-                retry_response = agent._run_codex_stream(codex_kwargs)
-                _ct_retry = agent._get_transport()
-                _cnr_retry = _ct_retry.normalize_response(retry_response)
-                final_response = (_cnr_retry.content or "").strip()
-            elif agent.api_mode == "anthropic_messages":
-                _tretry = agent._get_transport()
-                _ant_kw2 = _tretry.build_kwargs(
-                    model=agent.model,
-                    messages=api_messages,
-                    tools=None,
-                    is_oauth=agent._is_anthropic_oauth,
-                    max_tokens=agent.max_tokens,
-                    reasoning_config=agent.reasoning_config,
-                    preserve_dots=agent._anthropic_preserve_dots(),
-                    base_url=getattr(agent, "_anthropic_base_url", None),
-                )
-                _ant_kw2 = _merge_nous_portal_messages_extra_body(agent, _ant_kw2)
-                retry_response = _managed_summary_call(
-                    _ant_kw2,
-                    agent._anthropic_messages_create,
-                    retry_count=1,
-                )
-                _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=agent._is_anthropic_oauth)
-                final_response = (_retry_result.content or "").strip()
-            else:
-                summary_kwargs = {
-                    "model": agent.model,
-                    "messages": api_messages,
-                }
-                if _summary_temperature is not None:
-                    summary_kwargs["temperature"] = _summary_temperature
-                if agent.max_tokens is not None:
-                    summary_kwargs.update(agent._max_tokens_param(agent.max_tokens))
-                if _lm_reasoning_effort is not None:
-                    summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
-                if summary_extra_body:
-                    summary_kwargs["extra_body"] = summary_extra_body
-
-                summary_client = agent._ensure_primary_openai_client(
-                    reason="iteration_limit_summary_retry"
-                )
-                summary_response = _managed_summary_call(
-                    summary_kwargs,
-                    lambda request: summary_client.chat.completions.create(**request),
-                    retry_count=1,
-                )
-                _retry_result = agent._get_transport().normalize_response(summary_response)
-                final_response = (_retry_result.content or "").strip()
-
-            if final_response:
-                if "<think>" in final_response:
-                    final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
-                if final_response:
-                    summary_call_outcome = "success"
-                    append_message(
-                        messages,
-                        {"role": "assistant", "content": final_response},
-                    )
-                else:
-                    final_response = "I reached the iteration limit and couldn't generate a summary."
-            else:
-                final_response = "I reached the iteration limit and couldn't generate a summary."
+            final_response = local_handoff
 
     except Exception as e:
         logger.warning("Failed to get summary response: %s", e)
-        final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
+        final_response = local_handoff
     finally:
         from agent import relay_llm
 
