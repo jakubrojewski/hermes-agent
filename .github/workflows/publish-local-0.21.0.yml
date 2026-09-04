@@ -42,7 +42,9 @@ jobs:
             tests/run_agent/test_run_agent.py::TestHandleMaxIterations \
             tests/run_agent/test_run_agent_codex_responses.py \
             tests/agent/test_context_compressor.py \
-            tests/agent/test_compression_attempt_lifecycle.py
+            tests/agent/test_compression_attempt_lifecycle.py \
+            tests/tools/test_mcp_stdio_fastfail_reconnect.py \
+            -W error::RuntimeWarning
           uv run --with ruff ruff check \
             agent/chat_completion_helpers.py agent/codex_responses_adapter.py \
             agent/codex_runtime.py agent/context_compressor.py \
@@ -51,7 +53,9 @@ jobs:
             tests/agent/test_context_compressor.py \
             tests/agent/test_compression_attempt_lifecycle.py \
             tests/run_agent/test_run_agent.py \
-            tests/run_agent/test_run_agent_codex_responses.py
+            tests/run_agent/test_run_agent_codex_responses.py \
+            tools/mcp_tool.py \
+            tests/tools/test_mcp_stdio_fastfail_reconnect.py
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -101,6 +105,7 @@ jobs:
               "agent/conversation_loop.py": "/opt/hermes/agent/conversation_loop.py",
               "agent/turn_context.py": "/opt/hermes/agent/turn_context.py",
               "run_agent.py": "/opt/hermes/run_agent.py",
+              "tools/mcp_tool.py": "/opt/hermes/tools/mcp_tool.py",
           }
           script = "import hashlib,json,pathlib; print(json.dumps({p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in " + repr(list(files.values())) + "},sort_keys=True))"
           actual = json.loads(subprocess.check_output(["docker", "run", "--rm", "--entrypoint", "/opt/hermes/.venv/bin/python", image, "-c", script], text=True))
@@ -112,7 +117,7 @@ jobs:
               "/etc/hermes/image-provenance.json",
           ], text=True))
           assert provenance["revision"] == os.environ["GITHUB_SHA"]
-          assert provenance["candidate_identity"] == "da2e2829be99791160b3c3c76a4886970ba75a38ec494ee3e7dcac0ef1cbfdc4"
+          assert provenance["candidate_identity"] == "21ff6254afd8c227fc5488b729349a35f12a38c3af89a121edf91a64199c0994"
           assert provenance["base_digest"] == "sha256:64923faeae267792bf9bf87fe3b4c4869e35004e360c7df01730ad801b74d524"
           PY
 

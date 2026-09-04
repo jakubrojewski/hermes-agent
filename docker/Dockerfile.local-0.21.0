@@ -4,10 +4,11 @@ ARG HERMES_GIT_SHA
 LABEL org.opencontainers.image.revision="${HERMES_GIT_SHA}" \
       org.opencontainers.image.base.name="nousresearch/hermes-agent" \
       org.opencontainers.image.base.digest="sha256:64923faeae267792bf9bf87fe3b4c4869e35004e360c7df01730ad801b74d524" \
-      io.hermes.candidate.identity="da2e2829be99791160b3c3c76a4886970ba75a38ec494ee3e7dcac0ef1cbfdc4" \
+      io.hermes.candidate.identity="21ff6254afd8c227fc5488b729349a35f12a38c3af89a121edf91a64199c0994" \
       io.hermes.carried.max-iterations="NousResearch/hermes-agent#102453" \
       io.hermes.carried.compression="NousResearch/hermes-agent#99315" \
-      io.hermes.carried.compression-extras="joojalre/hermes-agent-almorshednet#25"
+      io.hermes.carried.compression-extras="joojalre/hermes-agent-almorshednet#25" \
+      io.hermes.carried.mcp-watcher="local:mcp-watcher-single-coroutine"
 
 COPY --chown=0:0 --chmod=0444 agent/chat_completion_helpers.py /opt/hermes/agent/chat_completion_helpers.py
 COPY --chown=0:0 --chmod=0444 agent/codex_responses_adapter.py /opt/hermes/agent/codex_responses_adapter.py
@@ -17,9 +18,10 @@ COPY --chown=0:0 --chmod=0444 agent/conversation_compression.py /opt/hermes/agen
 COPY --chown=0:0 --chmod=0444 agent/conversation_loop.py /opt/hermes/agent/conversation_loop.py
 COPY --chown=0:0 --chmod=0444 agent/turn_context.py /opt/hermes/agent/turn_context.py
 COPY --chown=0:0 --chmod=0444 run_agent.py /opt/hermes/run_agent.py
+COPY --chown=0:0 --chmod=0444 tools/mcp_tool.py /opt/hermes/tools/mcp_tool.py
 
 RUN set -eu; \
     test "${#HERMES_GIT_SHA}" -eq 40; \
     printf '%s\n' "${HERMES_GIT_SHA}" > /opt/hermes/.hermes_build_sha; \
     chmod 0444 /opt/hermes/.hermes_build_sha; \
-    HERMES_GIT_SHA="${HERMES_GIT_SHA}" python3 -c 'import json, os, pathlib; p=pathlib.Path("/etc/hermes/image-provenance.json"); p.write_text(json.dumps({"base_digest":"sha256:64923faeae267792bf9bf87fe3b4c4869e35004e360c7df01730ad801b74d524","candidate_identity":"da2e2829be99791160b3c3c76a4886970ba75a38ec494ee3e7dcac0ef1cbfdc4","carried_fixes":["NousResearch/hermes-agent#102453","NousResearch/hermes-agent#99315","joojalre/hermes-agent-almorshednet#25"],"deployment_kind":"derived-image","manager":"docker","revision":os.environ["HERMES_GIT_SHA"],"schema":2,"version":"0.21.0"},sort_keys=True,separators=(",",":"))+"\n",encoding="utf-8"); p.chmod(0o444)'
+    HERMES_GIT_SHA="${HERMES_GIT_SHA}" python3 -c 'import json, os, pathlib; p=pathlib.Path("/etc/hermes/image-provenance.json"); p.write_text(json.dumps({"base_digest":"sha256:64923faeae267792bf9bf87fe3b4c4869e35004e360c7df01730ad801b74d524","candidate_identity":"21ff6254afd8c227fc5488b729349a35f12a38c3af89a121edf91a64199c0994","carried_fixes":["NousResearch/hermes-agent#102453","NousResearch/hermes-agent#99315","joojalre/hermes-agent-almorshednet#25","local:mcp-watcher-single-coroutine"],"deployment_kind":"derived-image","manager":"docker","revision":os.environ["HERMES_GIT_SHA"],"schema":2,"version":"0.21.0"},sort_keys=True,separators=(",",":"))+"\n",encoding="utf-8"); p.chmod(0o444)'
