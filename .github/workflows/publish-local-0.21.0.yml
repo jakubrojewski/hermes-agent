@@ -40,14 +40,18 @@ jobs:
           uv python install 3.11
           uv run --with pytest --with pytest-asyncio pytest -q \
             tests/run_agent/test_run_agent.py::TestHandleMaxIterations \
+            tests/run_agent/test_run_agent_codex_responses.py \
             tests/agent/test_context_compressor.py \
             tests/agent/test_compression_attempt_lifecycle.py
           uv run --with ruff ruff check \
-            agent/chat_completion_helpers.py agent/codex_runtime.py \
-            agent/context_compressor.py agent/conversation_compression.py run_agent.py \
+            agent/chat_completion_helpers.py agent/codex_responses_adapter.py \
+            agent/codex_runtime.py agent/context_compressor.py \
+            agent/conversation_compression.py agent/conversation_loop.py \
+            agent/turn_context.py run_agent.py \
             tests/agent/test_context_compressor.py \
             tests/agent/test_compression_attempt_lifecycle.py \
-            tests/run_agent/test_run_agent.py
+            tests/run_agent/test_run_agent.py \
+            tests/run_agent/test_run_agent_codex_responses.py
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -90,9 +94,12 @@ jobs:
           image = f"{os.environ['IMAGE']}:{os.environ['TAG']}"
           files = {
               "agent/chat_completion_helpers.py": "/opt/hermes/agent/chat_completion_helpers.py",
+              "agent/codex_responses_adapter.py": "/opt/hermes/agent/codex_responses_adapter.py",
               "agent/codex_runtime.py": "/opt/hermes/agent/codex_runtime.py",
               "agent/context_compressor.py": "/opt/hermes/agent/context_compressor.py",
               "agent/conversation_compression.py": "/opt/hermes/agent/conversation_compression.py",
+              "agent/conversation_loop.py": "/opt/hermes/agent/conversation_loop.py",
+              "agent/turn_context.py": "/opt/hermes/agent/turn_context.py",
               "run_agent.py": "/opt/hermes/run_agent.py",
           }
           script = "import hashlib,json,pathlib; print(json.dumps({p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in " + repr(list(files.values())) + "},sort_keys=True))"
@@ -105,7 +112,7 @@ jobs:
               "/etc/hermes/image-provenance.json",
           ], text=True))
           assert provenance["revision"] == os.environ["GITHUB_SHA"]
-          assert provenance["candidate_identity"] == "67dee20b1626edb79f295d07960b1f25c83c99398988e4d8ddf7bf75f26de8dd"
+          assert provenance["candidate_identity"] == "bfbaf9b7755957ad27c118de178aa418d6fdea056e63931e298a4ade841e8681"
           assert provenance["base_digest"] == "sha256:64923faeae267792bf9bf87fe3b4c4869e35004e360c7df01730ad801b74d524"
           PY
 

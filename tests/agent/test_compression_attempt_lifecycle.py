@@ -20,6 +20,7 @@ collapsed lean compaction to one auxiliary request per attempt:
 from __future__ import annotations
 
 import copy
+import contextlib
 import os
 import threading
 import time
@@ -28,6 +29,7 @@ from unittest.mock import patch
 
 import pytest
 
+from agent import auxiliary_client as aux
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.conversation_compression import (
     CompressionCommitFence,
@@ -68,6 +70,271 @@ def _messages():
 
 
 class TestWorkerTeardownOnCeiling:
+    @pytest.mark.parametrize("timeout_kind", ["idle", "total"])
+    def test_outer_timeout_cancels_protected_aux_owner_within_grace(
+        self, tmp_path: Path, monkeypatch, timeout_kind: str
+    ) -> None:
+        """The host fence must stop the owner, not the isolated provider call."""
+        db, agent = _build_agent(tmp_path, f"AUX_OWNER_{timeout_kind.upper()}")
+        original = _messages()
+        baseline = copy.deepcopy(original)
+        fence = CompressionCommitFence()
+        provider_started = threading.Event()
+        release_provider = threading.Event()
+        provider_done = threading.Event()
+        owner_done = threading.Event()
+        admission_released = threading.Event()
+
+        monkeypatch.setattr(
+            "agent.conversation_compression._try_admit_compression_job",
+            lambda: True,
+        )
+
+        def _release_admission(*_args) -> None:
+            assert owner_done.is_set(), "admission released before owner exit"
+            admission_released.set()
+
+        monkeypatch.setattr(
+            "agent.conversation_compression._release_compression_admission",
+            _release_admission,
+        )
+
+        def _provider(_kwargs):
+            provider_started.set()
+            try:
+                while not release_provider.wait(0.01):
+                    if timeout_kind == "total":
+                        fence.touch_progress()
+                return [
+                    {"role": "assistant", "content": "late provider result"}
+                ]
+            finally:
+                provider_done.set()
+
+        def _compress(*_args, **_kwargs):
+            return aux._run_protected_sync_provider_call(_provider, {})
+
+        agent.context_compressor.compress = _compress
+
+        def _owner(worker_fence: CompressionCommitFence):
+            assert worker_fence is fence
+            try:
+                return agent._compress_context(
+                    original,
+                    "sys",
+                    approx_tokens=500_000,
+                    commit_fence=worker_fence,
+                )
+            finally:
+                owner_done.set()
+
+        try:
+            returned, prompt = run_compress_context_with_progress_timeout(
+                worker=_owner,
+                messages=original,
+                system_prompt_fallback="fallback",
+                idle_timeout_seconds=0.06,
+                total_ceiling_seconds=0.3,
+                fence=fence,
+                stall_fallback=False,
+            )
+
+            assert provider_started.is_set()
+            assert owner_done.wait(0.5), (
+                f"{timeout_kind} timeout did not cancel the protected auxiliary "
+                "owner within teardown grace"
+            )
+            assert admission_released.wait(0.5)
+            assert not provider_done.is_set(), (
+                "owner cancellation must not close or await the isolated provider call"
+            )
+            assert returned is original
+            assert prompt == "fallback"
+            assert original == baseline
+            assert db.get_compression_lock_holder(agent.session_id) is None
+        finally:
+            release_provider.set()
+            assert provider_done.wait(2)
+
+        # A late provider result belongs only to its isolated attempt and can
+        # never publish into the live transcript or durable session.
+        time.sleep(0.05)
+        assert original == baseline
+
+    def test_passive_deadline_waits_for_host_cancellation(
+        self, tmp_path: Path
+    ) -> None:
+        """Deadline observation alone must not impersonate a host cancellation."""
+        _db, agent = _build_agent(tmp_path, "PASSIVE_DEADLINE")
+        original = _messages()
+        fence = CompressionCommitFence(total_ceiling_seconds=0.05)
+        provider_started = threading.Event()
+        release_provider = threading.Event()
+        provider_done = threading.Event()
+        owner_done = threading.Event()
+
+        def _provider(_kwargs):
+            provider_started.set()
+            try:
+                assert release_provider.wait(2)
+                return [{"role": "assistant", "content": "late"}]
+            finally:
+                provider_done.set()
+
+        agent.context_compressor.compress = lambda *_a, **_kw: (
+            aux._run_protected_sync_provider_call(_provider, {})
+        )
+
+        def _owner():
+            try:
+                agent._compress_context(
+                    original,
+                    "sys",
+                    approx_tokens=500_000,
+                    commit_fence=fence,
+                )
+            finally:
+                owner_done.set()
+
+        owner = threading.Thread(target=_owner, daemon=True)
+        owner.start()
+        try:
+            assert provider_started.wait(1)
+            assert not owner_done.wait(0.15), (
+                "passive deadline cancelled the auxiliary owner before the host "
+                "won fence cancellation"
+            )
+            assert fence.cancel_before_commit() is True
+            assert owner_done.wait(0.5)
+            assert not provider_done.is_set()
+        finally:
+            release_provider.set()
+            assert provider_done.wait(2)
+            owner.join(2)
+
+    def test_completed_future_after_deadline_is_classified_as_total_timeout(
+        self, monkeypatch
+    ) -> None:
+        """A no-commit result at the deadline must still run timeout bookkeeping."""
+        original = _messages()
+        causes = []
+        timeouts = []
+
+        class _DoneFuture:
+            def __init__(self, result):
+                self._result = result
+
+            def add_done_callback(self, callback):
+                callback(self)
+
+            def cancel(self):
+                return False
+
+            def result(self, timeout=None):
+                return self._result
+
+        class _InlineExecutor:
+            def submit(self, fn, worker_fence):
+                return _DoneFuture(fn(worker_fence))
+
+        monkeypatch.setattr(
+            "agent.conversation_compression._get_compress_timeout_executor",
+            lambda: _InlineExecutor(),
+        )
+        monkeypatch.setattr(
+            "agent.conversation_compression._try_admit_compression_job",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            "agent.conversation_compression._release_compression_admission",
+            lambda *_args: None,
+        )
+
+        def _worker(worker_fence: CompressionCommitFence):
+            worker_fence._deadline = time.monotonic() - 1
+            return [{"role": "assistant", "content": "too late"}], "late"
+
+        returned, prompt = run_compress_context_with_progress_timeout(
+            worker=_worker,
+            messages=original,
+            system_prompt_fallback="fallback",
+            idle_timeout_seconds=1,
+            total_ceiling_seconds=1,
+            on_timeout_cause=lambda total, progress: causes.append(
+                (total, progress)
+            ),
+            on_timeout=lambda idle, waited, since_progress: timeouts.append(
+                (idle, waited, since_progress)
+            ),
+            stall_fallback=False,
+        )
+
+        assert returned is original
+        assert prompt == "fallback"
+        assert causes == [(True, False)]
+        assert len(timeouts) == 1
+
+    def test_sabotage_dropping_fence_cancel_source_keeps_owner_alive(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Sensitivity check: the old hard-cancel-only scope recreates the leak."""
+        _db, agent = _build_agent(tmp_path, "AUX_OWNER_SABOTAGE")
+        original = _messages()
+        fence = CompressionCommitFence()
+        provider_started = threading.Event()
+        release_provider = threading.Event()
+        owner_done = threading.Event()
+        real_protection = aux.aux_interrupt_protection
+
+        @contextlib.contextmanager
+        def _hard_cancel_only(*, active=True, **_ignored):
+            with real_protection(
+                active=active,
+                cancel_event=agent._hard_interrupt_requested,
+            ):
+                yield
+
+        monkeypatch.setattr(aux, "aux_interrupt_protection", _hard_cancel_only)
+
+        def _provider(_kwargs):
+            provider_started.set()
+            assert release_provider.wait(2)
+            return [{"role": "assistant", "content": "late"}]
+
+        agent.context_compressor.compress = lambda *_a, **_kw: (
+            aux._run_protected_sync_provider_call(_provider, {})
+        )
+
+        def _owner(worker_fence: CompressionCommitFence):
+            try:
+                return agent._compress_context(
+                    original,
+                    "sys",
+                    approx_tokens=500_000,
+                    commit_fence=worker_fence,
+                )
+            finally:
+                owner_done.set()
+
+        try:
+            returned, prompt = run_compress_context_with_progress_timeout(
+                worker=_owner,
+                messages=original,
+                system_prompt_fallback="fallback",
+                idle_timeout_seconds=0.06,
+                total_ceiling_seconds=0.3,
+                fence=fence,
+                stall_fallback=False,
+            )
+            assert provider_started.is_set()
+            assert not owner_done.wait(0.15), (
+                "sabotage did not recreate the old detached-owner failure"
+            )
+            assert returned is original and prompt == "fallback"
+        finally:
+            release_provider.set()
+            assert owner_done.wait(2)
+
     def test_cooperative_worker_joined_within_grace(self):
         """A worker that exits promptly after cancel is joined on the
         total-ceiling path; the lease is released normally (no retention) —

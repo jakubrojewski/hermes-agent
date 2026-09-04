@@ -26,7 +26,10 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
-from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.codex_responses_adapter import (
+    _summarize_user_message_for_log,
+    native_responses_owns_automatic_compaction,
+)
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
@@ -2791,6 +2794,7 @@ def run_conversation(
         )()
         if (
             agent.compression_enabled
+            and not native_responses_owns_automatic_compaction(agent)
             and not _review_fork_first_request_pending(agent)
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
@@ -2915,6 +2919,7 @@ def run_conversation(
                 continue
         elif (
             agent.compression_enabled
+            and not native_responses_owns_automatic_compaction(agent)
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _defer_preflight(request_pressure_tokens)
@@ -7769,6 +7774,7 @@ def run_conversation(
 
                 if (
                     agent.compression_enabled
+                    and not native_responses_owns_automatic_compaction(agent)
                     and compression_attempts < max_compression_attempts
                     and _compressor.should_compress(_real_tokens)
                 ):
@@ -7819,7 +7825,10 @@ def run_conversation(
                                 final_response = _HANDOFF_SKIP_FINAL_RESPONSE
                             _turn_exit_reason = "compaction_handoff_not_actionable"
                             break
-                elif agent.compression_enabled:
+                elif (
+                    agent.compression_enabled
+                    and not native_responses_owns_automatic_compaction(agent)
+                ):
                     # Over threshold but compression is blocked (summary-LLM
                     # cooldown or anti-thrashing). Surface a deduped warning so
                     # the user isn't left with a silently growing context that

@@ -64,6 +64,7 @@ import uuid
 import threading
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
@@ -841,6 +842,16 @@ class CompressionCommitFence:
         """True after cancellation won before the commit boundary."""
         return self._cancelled or self._admission_revoked or self.deadline_exceeded
 
+    @property
+    def cancellation_requested(self) -> bool:
+        """True only after the host actively cancelled this attempt."""
+        return self._cancelled or self._admission_revoked
+
+    @property
+    def commit_started(self) -> bool:
+        """Whether this attempt ever entered the commit boundary."""
+        return self._commit_started
+
     def retain_compression_lock_until_worker_done(self) -> None:
         """Prevent a timed-out live worker from overlapping a retry."""
         self._retain_cancelled_lock_until_worker_done = True
@@ -1564,6 +1575,8 @@ def run_compress_context_with_progress_timeout(
             )
             try:
                 result = future.result(timeout=wait_slice)
+                if fence.deadline_exceeded and not fence.commit_started:
+                    break
                 handled_exit = True
                 return result
             except concurrent.futures.TimeoutError:
@@ -3937,13 +3950,35 @@ def compress_context(
         if commit_fence is not None:
             _install_compression_cancelled_check(
                 agent.context_compressor,
-                lambda: commit_fence.is_cancelled,
+                lambda: commit_fence.cancellation_requested,
                 _attempt_generation,
             )
         # Incoming-message interrupts and active-turn redirects must not tear an
         # atomic summary in half (#23975). Explicit stop surfaces set a separate
-        # Event atomically; never infer cause from the racy message fields.
+        # Event atomically; never infer cause from the racy message fields. The
+        # host fence shares this one cancellation source so its idle/deadline
+        # timeout also releases the compression-owning auxiliary thread while
+        # the isolated provider request finishes under its own timeout.
         _hard_cancel_event = getattr(agent, "_hard_interrupt_requested", None)
+
+        def _compression_cancel_requested() -> bool:
+            hard_cancelled = (
+                _hard_cancel_event is not None
+                and callable(getattr(_hard_cancel_event, "is_set", None))
+                and _hard_cancel_event.is_set()
+            )
+            return bool(
+                hard_cancelled
+                or (
+                    commit_fence is not None
+                    and commit_fence.cancellation_requested
+                )
+            )
+
+        _compression_cancel_source = SimpleNamespace(
+            is_set=_compression_cancel_requested
+        )
+
         try:
             # F6: never start expensive summary work for an already-cancelled
             # fence (a stale queued job admitted after host departure).
@@ -3956,16 +3991,13 @@ def compress_context(
                 compressed = messages
             else:
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
-                    cancel_event=_hard_cancel_event
+                    cancel_event=_compression_cancel_source
                 ):
                     compressed = compress_fn(messages, **compress_kwargs)
-                    # Freeze a hard stop that arrived after the final provider
-                    # attempt unwound but before this transaction can rotate
-                    # session state.
-                    if (
-                        _hard_cancel_event is not None
-                        and _hard_cancel_event.is_set()
-                    ):
+                    # Freeze a stop/deadline that arrived after the final
+                    # provider attempt unwound but before this transaction can
+                    # rotate session state.
+                    if _compression_cancel_requested():
                         raise AuxiliaryExplicitCancellation()
         finally:
             if commit_fence is not None:
