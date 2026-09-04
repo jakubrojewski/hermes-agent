@@ -1,0 +1,161 @@
+name: Publish local Hermes 0.21.0 candidate
+
+on:
+  push:
+    branches:
+      - deploy/0.21.0-combined-fixes
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-local-0.21.0-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/jakubrojewski/hermes-agent
+  TAG: 0.21.0-combined-${{ github.sha }}
+
+jobs:
+  build-test-publish:
+    if: github.ref == 'refs/heads/deploy/0.21.0-combined-fixes'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+
+      - name: Verify source contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv python install 3.11
+          uv run --with pytest --with pytest-asyncio pytest -q \
+            tests/run_agent/test_run_agent.py::TestHandleMaxIterations \
+            tests/agent/test_context_compressor.py \
+            tests/agent/test_compression_attempt_lifecycle.py
+          uv run --with ruff ruff check \
+            agent/chat_completion_helpers.py agent/codex_runtime.py \
+            agent/context_compressor.py agent/conversation_compression.py run_agent.py \
+            tests/agent/test_context_compressor.py \
+            tests/agent/test_compression_attempt_lifecycle.py \
+            tests/run_agent/test_run_agent.py
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build tested amd64 image
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: docker/Dockerfile.local-0.21.0
+          load: true
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}
+          build-args: |
+            HERMES_GIT_SHA=${{ github.sha }}
+
+      - name: Verify overlay and inherited container contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, subprocess
+
+          base = "nousresearch/hermes-agent@sha256:64923faeae267792bf9bf87fe3b4c4869e35004e360c7df01730ad801b74d524"
+          candidate = f"{__import__('os').environ['IMAGE']}:{__import__('os').environ['TAG']}"
+          subprocess.run(["docker", "pull", base], check=True, stdout=subprocess.DEVNULL)
+
+          def inspect(image):
+              return json.loads(subprocess.check_output(["docker", "image", "inspect", image]))[0]["Config"]
+
+          left, right = inspect(base), inspect(candidate)
+          keys = ("User", "Entrypoint", "Cmd", "WorkingDir", "Volumes", "ExposedPorts", "StopSignal")
+          for key in keys:
+              assert left.get(key) == right.get(key), (key, left.get(key), right.get(key))
+          assert left.get("Env") == right.get("Env"), "environment contract changed"
+          PY
+
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+
+          image = f"{os.environ['IMAGE']}:{os.environ['TAG']}"
+          files = {
+              "agent/chat_completion_helpers.py": "/opt/hermes/agent/chat_completion_helpers.py",
+              "agent/codex_runtime.py": "/opt/hermes/agent/codex_runtime.py",
+              "agent/context_compressor.py": "/opt/hermes/agent/context_compressor.py",
+              "agent/conversation_compression.py": "/opt/hermes/agent/conversation_compression.py",
+              "run_agent.py": "/opt/hermes/run_agent.py",
+          }
+          script = "import hashlib,json,pathlib; print(json.dumps({p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in " + repr(list(files.values())) + "},sort_keys=True))"
+          actual = json.loads(subprocess.check_output(["docker", "run", "--rm", "--entrypoint", "/opt/hermes/.venv/bin/python", image, "-c", script], text=True))
+          for source, target in files.items():
+              expected = hashlib.sha256(pathlib.Path(source).read_bytes()).hexdigest()
+              assert actual[target] == expected, (source, target)
+          provenance = json.loads(subprocess.check_output([
+              "docker", "run", "--rm", "--entrypoint", "cat", image,
+              "/etc/hermes/image-provenance.json",
+          ], text=True))
+          assert provenance["revision"] == os.environ["GITHUB_SHA"]
+          assert provenance["candidate_identity"] == "67dee20b1626edb79f295d07960b1f25c83c99398988e4d8ddf7bf75f26de8dd"
+          assert provenance["base_digest"] == "sha256:64923faeae267792bf9bf87fe3b4c4869e35004e360c7df01730ad801b74d524"
+          PY
+
+      - name: Run bounded Docker preflight
+        env:
+          HERMES_TEST_IMAGE: ${{ env.IMAGE }}:${{ env.TAG }}
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --with pytest --with pytest-asyncio pytest -q \
+            tests/docker/test_smoke.py \
+            tests/docker/test_s6_profile_gateway_integration.py \
+            tests/docker/test_gateway_run_supervised.py \
+            tests/docker/test_dashboard.py \
+            tests/docker/test_sqlite_runtime.py \
+            tests/docker/test_immutable_install.py \
+            tests/docker/test_immutable_install_permissions.py \
+            tests/docker/test_docker_exec_privilege_drop.py \
+            tests/docker/test_container_restart.py \
+            tests/docker/test_dump_build_sha.py
+
+      - name: Reject secret-like image history
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker history --no-trunc --format '{{.CreatedBy}}' "$IMAGE:$TAG" > /tmp/image-history.txt
+          if grep -Eq 'gh[pousr]_[0-9A-Za-z]{20,}|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY' /tmp/image-history.txt; then
+            echo '::error::secret-like material found in image history'
+            exit 1
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish tested image and verify exact digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE:$TAG"
+          docker pull "$IMAGE:$TAG"
+          resolved="$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$TAG")"
+          test -n "$resolved"
+          docker run --rm "$resolved" --help >/dev/null
+          baked="$(docker run --rm --entrypoint cat "$resolved" /opt/hermes/.hermes_build_sha)"
+          test "$baked" = "$GITHUB_SHA"
+          printf '### Published candidate\n\n- `%s`\n- `%s`\n' "$IMAGE:$TAG" "$resolved" >> "$GITHUB_STEP_SUMMARY"
